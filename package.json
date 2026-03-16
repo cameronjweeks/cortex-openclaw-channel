@@ -1,0 +1,19 @@
+{
+  "name": "cortex-openclaw-channel",
+  "version": "1.0.0",
+  "description": "OpenClaw channel plugin for Cortex Chat — connects your AI agent to Cortex via Socket.IO",
+  "main": "index.ts",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["openclaw", "channel", "cortex", "chat", "plugin"],
+  "author": "BACKV",
+  "license": "MIT",
+  "dependencies": {
+    "jsonwebtoken": "^9.0.3",
+    "socket.io-client": "^4.8.3"
+  }
+}

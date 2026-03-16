@@ -1,0 +1,9 @@
+{
+  "id": "cortex-channel",
+  "channels": ["cortex"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

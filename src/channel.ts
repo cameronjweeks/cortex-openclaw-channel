@@ -1,0 +1,361 @@
+/**
+ * Cortex Chat Channel Plugin for OpenClaw.
+ *
+ * Connects to cortex-realtime via Socket.IO as Bob,
+ * listens for messages, routes them through the agent,
+ * and sends responses back via the same socket RPC
+ * (so cortex-realtime handles DB + broadcast).
+ */
+import { getCortexRuntime } from "./runtime.js";
+
+const CHANNEL_ID = "cortex";
+const DEFAULT_ACCOUNT_ID = "default";
+
+// ─── Shared socket reference ─────────────────────────
+// The gateway.startAccount creates the socket connection.
+// outbound.sendText uses it to send replies via RPC.
+let activeSocket: any = null;
+
+// ─── Config helpers ──────────────────────────────────
+
+function getChannelConfig(cfg: any): any {
+  return cfg?.channels?.cortex ?? {};
+}
+
+function getAccountConfig(cfg: any, accountId?: string | null): any {
+  const channelCfg = getChannelConfig(cfg);
+  const id = accountId || DEFAULT_ACCOUNT_ID;
+  const account = channelCfg.accounts?.[id] ?? channelCfg;
+  return {
+    accountId: id,
+    enabled: account.enabled !== false && channelCfg.enabled !== false,
+    apiUrl: account.apiUrl || channelCfg.apiUrl || "http://localhost:3201",
+    realtimeUrl: account.realtimeUrl || channelCfg.realtimeUrl || "http://localhost:3202",
+    jwtSecret: account.jwtSecret || channelCfg.jwtSecret || "",
+    botEmail: account.botEmail || channelCfg.botEmail || "bob@backv.co",
+    botName: account.botName || channelCfg.botName || "Bob",
+  };
+}
+
+function listAccountIds(cfg: any): string[] {
+  const channelCfg = getChannelConfig(cfg);
+  if (channelCfg.accounts) return Object.keys(channelCfg.accounts);
+  if (channelCfg.apiUrl || channelCfg.jwtSecret) return [DEFAULT_ACCOUNT_ID];
+  return [];
+}
+
+// ─── Helpers ─────────────────────────────────────────
+
+function waitUntilAbort(signal?: AbortSignal, onAbort?: () => void): Promise<void> {
+  return new Promise((resolve) => {
+    const complete = () => { onAbort?.(); resolve(); };
+    if (!signal) return;
+    if (signal.aborted) { complete(); return; }
+    signal.addEventListener("abort", complete, { once: true });
+  });
+}
+
+function extractChannelId(target: string): number {
+  // target format: "cortex:channel:3" or "cortex:bob@backv.co" or just "3"
+  const match = target.match(/(\d+)/);
+  return match ? parseInt(match[1], 10) : 0;
+}
+
+/**
+ * Send a message via the socket.io apiRequest relay (same path as the browser SDK).
+ * cortex-realtime proxies to cortex-api, gets the response, and handles broadcast.
+ */
+function sendViaSocket(channelId: number, text: string, account?: any): Promise<{ ok: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    if (!activeSocket?.connected) {
+      resolve({ ok: false, error: "Socket not connected" });
+      return;
+    }
+
+    const apiUrl = account?.apiUrl || "https://cortex.bob.backv.co/api";
+
+    // Use the apiRequest.request event — this is how the cortex-sdk communicates
+    activeSocket.emit("apiRequest.request", {
+      url: `${apiUrl}/v1/chat/messages`,
+      params: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: { channelId, content: text, contentType: "text" },
+      },
+    }, (res: any) => {
+      if (res?.ok) {
+        resolve({ ok: true });
+      } else {
+        resolve({ ok: false, error: res?.body?.error || `HTTP ${res?.status}` || "Unknown error" });
+      }
+    });
+
+    // Timeout after 30s if no callback
+    setTimeout(() => resolve({ ok: false, error: "API request timeout" }), 30000);
+  });
+}
+
+// ─── Channel plugin ─────────────────────────────────
+
+export const cortexPlugin = {
+  id: CHANNEL_ID,
+
+  meta: {
+    id: CHANNEL_ID,
+    label: "Cortex Chat",
+    selectionLabel: "Cortex Chat (WebSocket)",
+    detailLabel: "Cortex Chat",
+    docsPath: "/channels/cortex",
+    blurb: "Internal team chat via Cortex",
+    order: 95,
+  },
+
+  capabilities: {
+    chatTypes: ["direct" as const, "channel" as const],
+    media: false,
+    threads: false,
+    reactions: false,
+    edit: false,
+    unsend: false,
+    reply: false,
+    effects: false,
+    blockStreaming: false,
+  },
+
+  reload: { configPrefixes: [`channels.${CHANNEL_ID}`] },
+
+  config: {
+    listAccountIds: (cfg: any) => listAccountIds(cfg),
+    resolveAccount: (cfg: any, accountId?: string | null) => getAccountConfig(cfg, accountId),
+    defaultAccountId: (_cfg: any) => DEFAULT_ACCOUNT_ID,
+    isConfigured: (account: any) => Boolean(account.jwtSecret && account.realtimeUrl),
+  },
+
+  outbound: {
+    deliveryMode: "direct" as const,
+    textChunkLimit: 4000,
+    sendText: async ({ to, text, cfg }: any) => {
+      // Send via the shared socket.io connection (same path as browser clients)
+      const channelId = extractChannelId(to);
+      console.log(`[cortex-channel] outbound.sendText: to=${to} channelId=${channelId} text=${(text||'').substring(0,60)}...`);
+
+      if (!channelId) {
+        console.error(`[cortex-channel] Could not extract channelId from target: ${to}`);
+        return { ok: false, error: `Invalid target: ${to}` };
+      }
+
+      const account = getAccountConfig(cfg);
+      const result = await sendViaSocket(channelId, text, account);
+      if (!result.ok) {
+        console.error(`[cortex-channel] Send failed: ${result.error}`);
+      } else {
+        console.log(`[cortex-channel] Message sent successfully to channel ${channelId}`);
+      }
+      return { channel: CHANNEL_ID, ...result };
+    },
+  },
+
+  gateway: {
+    startAccount: async (ctx: any) => {
+      const { cfg, accountId, log, abortSignal } = ctx;
+      const account = getAccountConfig(cfg, accountId);
+
+      if (!account.enabled) {
+        log?.info?.(`Cortex account ${accountId} is disabled, skipping`);
+        return waitUntilAbort(abortSignal);
+      }
+
+      if (!account.jwtSecret) {
+        log?.warn?.(`Cortex account ${accountId} missing jwtSecret, skipping`);
+        return waitUntilAbort(abortSignal);
+      }
+
+      log?.info?.(`Starting Cortex Chat channel (account: ${accountId}, url: ${account.realtimeUrl})`);
+
+      // Generate JWT for Bob
+      const token = await generateJwt(account);
+
+      // Connect to cortex-realtime via socket.io-client
+      const { io } = await import("socket.io-client");
+      const socket = io(account.realtimeUrl, {
+        auth: { token },
+        transports: ["websocket"],
+        reconnection: true,
+        reconnectionDelay: 3000,
+        reconnectionAttempts: Infinity,
+      });
+
+      // Store socket reference for outbound.sendText
+      activeSocket = socket;
+
+      socket.on("connect", () => {
+        log?.info?.("✓ Connected to Cortex Realtime");
+        ctx.setStatus?.({ running: true, lastStartAt: new Date().toISOString() });
+      });
+
+      socket.on("disconnect", (reason: string) => {
+        log?.warn?.(`✗ Cortex Realtime disconnected: ${reason}`);
+        ctx.setStatus?.({ running: false, lastStopAt: new Date().toISOString() });
+      });
+
+      socket.on("connect_error", (err: any) => {
+        log?.error?.(`Cortex Realtime connection error: ${err.message}`);
+      });
+
+      // Listen for new messages
+      socket.on("messages:new", async (message: any) => {
+        // Skip system messages first (session compaction, etc.)
+        if (message.content_type === "system") return;
+        // Skip our own messages (bot responses)
+        if (message.user_is_ai) return;
+        if (message.user_email === account.botEmail) return;
+
+        const channelId = message.channel_id;
+        const senderEmail = message.user_email || "unknown";
+        const senderName = message.user_name || senderEmail;
+        const content = message.content || "";
+
+        if (!content.trim()) return;
+
+        log?.info?.(`Cortex message from ${senderName} in channel ${channelId}: ${content.substring(0, 80)}...`);
+
+        try {
+          const rt = getCortexRuntime();
+          const currentCfg = rt.config.loadConfig();
+
+          // Fetch the active session key from cortex-api
+          let sessionKey = `cortex-channel-${channelId}`;
+          try {
+            const sessionRes = await fetch(`${account.apiUrl}/v1/chat/channels/${channelId}/session`, {
+              headers: { Authorization: `Bearer ${socket.auth?.token || ""}` },
+            });
+            if (sessionRes.ok) {
+              const sessionData = await sessionRes.json();
+              if (sessionData?.session?.sessionKey) {
+                sessionKey = sessionData.session.sessionKey;
+              }
+            }
+          } catch (e: any) {
+            log?.warn?.(`Failed to fetch session key for channel ${channelId}: ${e.message}`);
+          }
+
+          // Build inbound message context
+          const msgCtx = rt.channel.reply.finalizeInboundContext({
+            Body: content,
+            RawBody: content,
+            CommandBody: content,
+            From: `cortex:${senderEmail}`,
+            To: `cortex:channel:${channelId}`,
+            SessionKey: sessionKey,
+            AccountId: account.accountId,
+            OriginatingChannel: CHANNEL_ID,
+            OriginatingTo: `cortex:channel:${channelId}`,
+            ChatType: "channel",
+            SenderName: senderName,
+            SenderId: senderEmail,
+            Provider: CHANNEL_ID,
+            Surface: CHANNEL_ID,
+            ConversationLabel: `Cortex #${channelId}`,
+            Timestamp: Date.now(),
+            CommandAuthorized: true,
+          });
+
+          log?.info?.(`Dispatching to agent for channel ${channelId}...`);
+
+          // Dispatch to agent — reply comes back via outbound.sendText
+          await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+            ctx: msgCtx,
+            cfg: currentCfg,
+            dispatcherOptions: {
+              deliver: async (payload: { text?: string; body?: string }) => {
+                const text = payload?.text ?? payload?.body;
+                if (!text?.trim()) return;
+                log?.info?.(`Delivering reply to channel ${channelId} (${text.substring(0, 60)}...)`);
+                const result = await sendViaSocket(channelId, text);
+                if (!result.ok) {
+                  log?.error?.(`Failed to deliver reply: ${result.error}`);
+                }
+              },
+              onReplyStart: () => {
+                socket.emit("typing:start", { channelId });
+              },
+            },
+          });
+
+          log?.info?.(`Dispatch completed for channel ${channelId}`);
+
+          // Report real token usage from OpenClaw session back to Cortex
+          try {
+            const sessions = rt.config?.sessionStore?.sessions || rt.sessions;
+            // Try to read session token info from the store
+            let totalTokens = 0;
+            if (sessions) {
+              // The session store might be accessible via runtime
+              const sessionEntry = typeof sessions.get === 'function' 
+                ? sessions.get(sessionKey) 
+                : sessions[sessionKey];
+              if (sessionEntry?.totalTokens) {
+                totalTokens = sessionEntry.totalTokens;
+              }
+            }
+            
+            // If we can't read the session store directly, try the CLI approach
+            if (!totalTokens) {
+              const { execSync } = await import("child_process");
+              try {
+                const output = execSync(
+                  `openclaw sessions --json 2>/dev/null | grep -A15 '"key": "${sessionKey}"'`,
+                  { encoding: "utf8", timeout: 5000 }
+                );
+                const tokenMatch = output.match(/"totalTokens":\s*(\d+)/);
+                if (tokenMatch) totalTokens = parseInt(tokenMatch[1]);
+              } catch { /* non-critical */ }
+            }
+
+            if (totalTokens > 0) {
+              // Update Cortex session with real token count
+              const jwtToken = await generateJwt(account);
+              await fetch(`${account.apiUrl}/v1/chat/channels/${channelId}/session`, {
+                method: "PUT",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${jwtToken}`,
+                },
+                body: JSON.stringify({ tokenCount: totalTokens }),
+              });
+              log?.info?.(`Updated token count for channel ${channelId}: ${totalTokens}`);
+            }
+          } catch (tokenErr: any) {
+            log?.warn?.(`Failed to update token count: ${tokenErr.message}`);
+          }
+        } catch (err: any) {
+          log?.error?.(`Error processing Cortex message: ${err.message}`);
+          log?.error?.(`Stack: ${err.stack}`);
+        }
+      });
+
+      // Clean up on abort
+      return waitUntilAbort(abortSignal, () => {
+        log?.info?.("Stopping Cortex Chat channel");
+        activeSocket = null;
+        socket.disconnect();
+      });
+    },
+  },
+};
+
+// ─── JWT generation ──────────────────────────────────
+
+async function generateJwt(account: any): Promise<string> {
+  try {
+    const jwt = await import("jsonwebtoken");
+    const sign = (jwt as any).default?.sign || (jwt as any).sign;
+    return sign(
+      { email: account.botEmail, name: account.botName, picture: "" },
+      account.jwtSecret,
+      { expiresIn: "24h" }
+    );
+  } catch {
+    throw new Error("jsonwebtoken not available — install it in the extensions directory");
+  }
+}
