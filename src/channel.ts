@@ -15,6 +15,49 @@ const DEFAULT_ACCOUNT_ID = "default";
 // The gateway.startAccount creates the socket connection.
 // outbound.sendText uses it to send replies via RPC.
 let activeSocket: any = null;
+let cachedBotId: number | null = null;
+let cachedJwtToken: string | null = null;
+
+// ─── Task reporting helper ───────────────────────────
+
+async function reportTask(
+  apiUrl: string,
+  botId: number,
+  token: string,
+  data: { taskKey: string; label: string; status: string; type?: string; metadata?: any }
+): Promise<void> {
+  try {
+    const res = await fetch(`${apiUrl}/v1/bots/${botId}/tasks`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[cortex-channel] Task report failed (${res.status}): ${body}`);
+    }
+  } catch (err: any) {
+    console.error(`[cortex-channel] Task report error: ${err.message}`);
+  }
+}
+
+async function fetchBotId(apiUrl: string, token: string): Promise<number | null> {
+  try {
+    const res = await fetch(`${apiUrl}/v1/bots`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    // Find the bot whose user matches this connection (first one owned or self)
+    if (data.bots?.length) return data.bots[0].id;
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 // ─── Config helpers ──────────────────────────────────
 
@@ -188,9 +231,20 @@ export const cortexPlugin = {
       // Store socket reference for outbound.sendText
       activeSocket = socket;
 
-      socket.on("connect", () => {
+      socket.on("connect", async () => {
         log?.info?.("✓ Connected to Cortex Realtime");
         ctx.setStatus?.({ running: true, lastStartAt: new Date().toISOString() });
+
+        // Cache bot ID and JWT for task reporting
+        if (!cachedBotId) {
+          cachedJwtToken = token;
+          cachedBotId = await fetchBotId(account.apiUrl, token);
+          if (cachedBotId) {
+            log?.info?.(`Bot ID resolved: ${cachedBotId}`);
+          } else {
+            log?.warn?.("Could not resolve bot ID — task reporting disabled");
+          }
+        }
       });
 
       socket.on("disconnect", (reason: string) => {
@@ -262,25 +316,63 @@ export const cortexPlugin = {
 
           log?.info?.(`Dispatching to agent for channel ${channelId}...`);
 
-          // Dispatch to agent — reply comes back via outbound.sendText
-          await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-            ctx: msgCtx,
-            cfg: currentCfg,
-            dispatcherOptions: {
-              deliver: async (payload: { text?: string; body?: string }) => {
-                const text = payload?.text ?? payload?.body;
-                if (!text?.trim()) return;
-                log?.info?.(`Delivering reply to channel ${channelId} (${text.substring(0, 60)}...)`);
-                const result = await sendViaSocket(channelId, text);
-                if (!result.ok) {
-                  log?.error?.(`Failed to deliver reply: ${result.error}`);
-                }
+          // Report task as running
+          const taskKey = `msg-${channelId}-${Date.now()}`;
+          const taskLabel = content.length > 80 ? content.substring(0, 77) + "..." : content;
+          if (cachedBotId && cachedJwtToken) {
+            reportTask(account.apiUrl, cachedBotId, cachedJwtToken, {
+              taskKey,
+              label: taskLabel,
+              status: "running",
+              type: "session",
+              metadata: { sessionKey, channelId, sender: senderName },
+            });
+          }
+
+          let taskStatus = "completed";
+          let taskError: string | undefined;
+
+          try {
+            // Dispatch to agent — reply comes back via outbound.sendText
+            await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+              ctx: msgCtx,
+              cfg: currentCfg,
+              dispatcherOptions: {
+                deliver: async (payload: { text?: string; body?: string }) => {
+                  const text = payload?.text ?? payload?.body;
+                  if (!text?.trim()) return;
+                  log?.info?.(`Delivering reply to channel ${channelId} (${text.substring(0, 60)}...)`);
+                  const result = await sendViaSocket(channelId, text);
+                  if (!result.ok) {
+                    log?.error?.(`Failed to deliver reply: ${result.error}`);
+                  }
+                },
+                onReplyStart: () => {
+                  socket.emit("typing:start", { channelId });
+                },
               },
-              onReplyStart: () => {
-                socket.emit("typing:start", { channelId });
-              },
-            },
-          });
+            });
+          } catch (dispatchErr: any) {
+            taskStatus = "failed";
+            taskError = dispatchErr.message;
+            throw dispatchErr;
+          } finally {
+            // Report task completion/failure
+            if (cachedBotId && cachedJwtToken) {
+              reportTask(account.apiUrl, cachedBotId, cachedJwtToken, {
+                taskKey,
+                label: taskLabel,
+                status: taskStatus,
+                type: "session",
+                metadata: {
+                  sessionKey,
+                  channelId,
+                  sender: senderName,
+                  ...(taskError ? { error: taskError } : {}),
+                },
+              });
+            }
+          }
 
           log?.info?.(`Dispatch completed for channel ${channelId}`);
 
