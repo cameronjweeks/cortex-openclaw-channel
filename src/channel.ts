@@ -105,8 +105,8 @@ function extractChannelId(target: string): number {
 }
 
 /**
- * Send a message via the socket.io apiRequest relay (same path as the browser SDK).
- * cortex-realtime proxies to cortex-api, gets the response, and handles broadcast.
+ * Send a message via the socket.io apiRequest relay.
+ * cortex-realtime proxies to cortex-api, handles DB insert + broadcast.
  */
 function sendViaSocket(channelId: number, text: string, account?: any): Promise<{ ok: boolean; error?: string }> {
   return new Promise((resolve) => {
@@ -116,8 +116,8 @@ function sendViaSocket(channelId: number, text: string, account?: any): Promise<
     }
 
     const apiUrl = account?.apiUrl || "https://cortex.bob.backv.co/api";
+    let resolved = false;
 
-    // Use the apiRequest.request event — this is how the cortex-sdk communicates
     activeSocket.emit("apiRequest.request", {
       url: `${apiUrl}/v1/chat/messages`,
       params: {
@@ -126,6 +126,8 @@ function sendViaSocket(channelId: number, text: string, account?: any): Promise<
         body: { channelId, content: text, contentType: "text" },
       },
     }, (res: any) => {
+      if (resolved) return;
+      resolved = true;
       if (res?.ok) {
         resolve({ ok: true });
       } else {
@@ -133,8 +135,13 @@ function sendViaSocket(channelId: number, text: string, account?: any): Promise<
       }
     });
 
-    // Timeout after 30s if no callback
-    setTimeout(() => resolve({ ok: false, error: "API request timeout" }), 30000);
+    // Timeout after 30s
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        resolve({ ok: false, error: "API request timeout (30s)" });
+      }
+    }, 30000);
   });
 }
 
