@@ -18,6 +18,45 @@ let activeSocket: any = null;
 let cachedBotId: number | null = null;
 let cachedJwtToken: string | null = null;
 
+// ─── Session Management ──────────────────────────────
+// Maintain stable OpenClaw sessions per channel to prevent fragmentation
+// Map: channelId -> { cortexSessionKey, openclawSessionKey, lastActivity }
+const channelSessions = new Map<number, {
+  cortexSessionKey: string;
+  openclawSessionKey: string;
+  lastActivity: number;
+}>();
+
+// Session timeout: 24 hours of inactivity forces a new session
+const SESSION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+function getStableSessionKey(channelId: number, cortexSessionKey: string): string {
+  const now = Date.now();
+  const existing = channelSessions.get(channelId);
+  
+  // Check if we have an existing session and it's not expired
+  if (existing && (now - existing.lastActivity) < SESSION_TIMEOUT_MS) {
+    // Update activity timestamp
+    existing.lastActivity = now;
+    existing.cortexSessionKey = cortexSessionKey; // Track current Cortex session
+    channelSessions.set(channelId, existing);
+    
+    console.log(`[cortex-channel] Using stable session ${existing.openclawSessionKey} for channel ${channelId} (Cortex: ${cortexSessionKey})`);
+    return existing.openclawSessionKey;
+  }
+  
+  // Create new stable session
+  const openclawSessionKey = `cortex-channel-${channelId}`;
+  channelSessions.set(channelId, {
+    cortexSessionKey,
+    openclawSessionKey,
+    lastActivity: now
+  });
+  
+  console.log(`[cortex-channel] Created stable session ${openclawSessionKey} for channel ${channelId} (Cortex: ${cortexSessionKey})`);
+  return openclawSessionKey;
+}
+
 // ─── Task reporting helper ───────────────────────────
 
 async function reportTask(
@@ -54,6 +93,64 @@ async function fetchBotId(apiUrl: string, token: string): Promise<number | null>
     // Find the bot whose user matches this connection (first one owned or self)
     if (data.bots?.length) return data.bots[0].id;
     return null;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Channel Task helpers ────────────────────────────
+
+async function fetchChannelTasks(apiUrl: string, channelId: number, token: string): Promise<any[]> {
+  try {
+    const res = await fetch(`${apiUrl}/v1/chat/channels/${channelId}/tasks`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.tasks || [];
+  } catch {
+    return [];
+  }
+}
+
+function formatTasksForContext(tasks: any[]): string | null {
+  if (!tasks.length) return null;
+  const lines = tasks.map((t: any) => {
+    const icon = t.status === 'in_progress' ? '◉' : t.status === 'completed' ? '✓' : t.status === 'cancelled' ? '✕' : '○';
+    return `- [${icon} ${t.status.replace('_', ' ')}] #${t.id}: ${t.label}`;
+  });
+  return `Channel Tasks:\n${lines.join('\n')}`;
+}
+
+async function createChannelTask(
+  apiUrl: string, channelId: number, token: string,
+  data: { label: string; status?: string; sourceMessageId?: number; metadata?: any }
+): Promise<any | null> {
+  try {
+    const res = await fetch(`${apiUrl}/v1/chat/channels/${channelId}/tasks`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) return null;
+    return (await res.json()).task;
+  } catch {
+    return null;
+  }
+}
+
+async function updateChannelTaskStatus(
+  apiUrl: string, channelId: number, taskId: number, token: string,
+  updates: { status?: string; label?: string; metadata?: any }
+): Promise<any | null> {
+  try {
+    const res = await fetch(`${apiUrl}/v1/chat/channels/${channelId}/tasks/${taskId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(updates),
+    });
+    if (!res.ok) return null;
+    return (await res.json()).task;
   } catch {
     return null;
   }
@@ -162,7 +259,7 @@ export const cortexPlugin = {
 
   capabilities: {
     chatTypes: ["direct" as const, "channel" as const],
-    media: false,
+    media: true,
     threads: false,
     reactions: false,
     edit: false,
@@ -257,6 +354,10 @@ export const cortexPlugin = {
       socket.on("disconnect", (reason: string) => {
         log?.warn?.(`✗ Cortex Realtime disconnected: ${reason}`);
         ctx.setStatus?.({ running: false, lastStopAt: new Date().toISOString() });
+        
+        // Don't clear session mappings on disconnect - we want them to persist
+        // This allows reconnections to maintain conversation continuity
+        log?.info?.(`Session mappings preserved for reconnection (${channelSessions.size} channels)`);
       });
 
       socket.on("connect_error", (err: any) => {
@@ -272,11 +373,32 @@ export const cortexPlugin = {
         if (message.user_email === account.botEmail) return;
 
         const channelId = message.channel_id;
+        const messageId = message.id;
         const senderEmail = message.user_email || "unknown";
         const senderName = message.user_name || senderEmail;
         const content = message.content || "";
 
-        if (!content.trim()) return;
+        // Socket.IO doesn't include attachments, so fetch via the messages list endpoint with the specific message ID
+        let attachments: any[] = [];
+        try {
+          // Use the messages list endpoint filtered by channelId and look for our specific message
+          const msgRes = await fetch(`${account.apiUrl}/v1/chat/messages?channelId=${channelId}&limit=50`, {
+            headers: { Authorization: `Bearer ${socket.auth?.token || ""}` },
+          });
+          if (msgRes.ok) {
+            const msgData = await msgRes.json();
+            // Find our specific message in the list
+            const ourMessage = msgData.messages?.find((m: any) => m.id === messageId);
+            if (ourMessage) {
+              attachments = ourMessage.attachments || [];
+              log?.info?.(`Found ${attachments.length} attachment(s) for message ${messageId}`);
+            }
+          }
+        } catch (e: any) {
+          log?.warn?.(`Failed to fetch message details for attachment check: ${e.message}`);
+        }
+
+        if (!content.trim() && attachments.length === 0) return;
 
         log?.info?.(`Cortex message from ${senderName} in channel ${channelId}: ${content.substring(0, 80)}...`);
 
@@ -285,7 +407,7 @@ export const cortexPlugin = {
           const currentCfg = rt.config.loadConfig();
 
           // Fetch the active session key from cortex-api
-          let sessionKey = `cortex-channel-${channelId}`;
+          let cortexSessionKey = `cortex-channel-${channelId}`;
           try {
             const sessionRes = await fetch(`${account.apiUrl}/v1/chat/channels/${channelId}/session`, {
               headers: { Authorization: `Bearer ${socket.auth?.token || ""}` },
@@ -293,12 +415,30 @@ export const cortexPlugin = {
             if (sessionRes.ok) {
               const sessionData = await sessionRes.json();
               if (sessionData?.session?.sessionKey) {
-                sessionKey = sessionData.session.sessionKey;
+                cortexSessionKey = sessionData.session.sessionKey;
               }
             }
           } catch (e: any) {
             log?.warn?.(`Failed to fetch session key for channel ${channelId}: ${e.message}`);
           }
+
+          // Use stable session key for OpenClaw to maintain conversation continuity
+          const sessionKey = getStableSessionKey(channelId, cortexSessionKey);
+
+          // Fetch channel tasks for context injection
+          const jwtForTasks = socket.auth?.token || cachedJwtToken || token;
+          const channelTasksList = await fetchChannelTasks(account.apiUrl, channelId, jwtForTasks);
+          const tasksContext = formatTasksForContext(channelTasksList);
+          const untrustedContext: string[] = [];
+          if (tasksContext) untrustedContext.push(tasksContext);
+
+          // Build attachment info if present
+          const mediaData = attachments.map((att: any) => ({
+            url: `${account.apiUrl}${att.url}`,
+            mimeType: att.mime_type,
+            fileName: att.filename,
+            fileSize: att.size_bytes,
+          }));
 
           // Build inbound message context
           const msgCtx = rt.channel.reply.finalizeInboundContext({
@@ -319,11 +459,13 @@ export const cortexPlugin = {
             ConversationLabel: `Cortex #${channelId}`,
             Timestamp: Date.now(),
             CommandAuthorized: true,
+            UntrustedContext: untrustedContext,
+            ...(mediaData.length > 0 && { MediaData: mediaData }),
           });
 
           log?.info?.(`Dispatching to agent for channel ${channelId}...`);
 
-          // Report task as running
+          // Report bot_task as running (existing system-level tracking)
           const taskKey = `msg-${channelId}-${Date.now()}`;
           const taskLabel = content.length > 80 ? content.substring(0, 77) + "..." : content;
           if (cachedBotId && cachedJwtToken) {
@@ -334,6 +476,24 @@ export const cortexPlugin = {
               type: "session",
               metadata: { sessionKey, channelId, sender: senderName },
             });
+          }
+
+          // Create a channel task for this work item (visible in the UI panel)
+          let channelTaskId: number | null = null;
+          const channelTaskToken = jwtForTasks;
+          try {
+            const ct = await createChannelTask(account.apiUrl, channelId, channelTaskToken, {
+              label: taskLabel,
+              status: "in_progress",
+              sourceMessageId: message.id || null,
+              metadata: { sender: senderName, sessionKey, automated: true },
+            });
+            if (ct) {
+              channelTaskId = ct.id;
+              log?.info?.(`Channel task #${ct.id} created for channel ${channelId}`);
+            }
+          } catch (ctErr: any) {
+            log?.warn?.(`Failed to create channel task: ${ctErr.message}`);
           }
 
           let taskStatus = "completed";
@@ -364,7 +524,7 @@ export const cortexPlugin = {
             taskError = dispatchErr.message;
             throw dispatchErr;
           } finally {
-            // Report task completion/failure
+            // Report bot_task completion/failure
             if (cachedBotId && cachedJwtToken) {
               reportTask(account.apiUrl, cachedBotId, cachedJwtToken, {
                 taskKey,
@@ -378,6 +538,20 @@ export const cortexPlugin = {
                   ...(taskError ? { error: taskError } : {}),
                 },
               });
+            }
+
+            // Complete the channel task (auto-hide after 24h kicks in server-side)
+            if (channelTaskId) {
+              try {
+                const finalStatus = taskStatus === "failed" ? "cancelled" : "completed";
+                await updateChannelTaskStatus(account.apiUrl, channelId, channelTaskId, channelTaskToken, {
+                  status: finalStatus,
+                  ...(taskError ? { metadata: { error: taskError } } : {}),
+                });
+                log?.info?.(`Channel task #${channelTaskId} → ${finalStatus}`);
+              } catch (ctErr: any) {
+                log?.warn?.(`Failed to update channel task #${channelTaskId}: ${ctErr.message}`);
+              }
             }
           }
 
