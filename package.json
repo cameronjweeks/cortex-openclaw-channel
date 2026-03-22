@@ -21,7 +21,11 @@
   "author": "BACKV",
   "license": "MIT",
   "dependencies": {
+    "@types/node": "^25.5.0",
+    "@types/ws": "^8.18.1",
     "jsonwebtoken": "^9.0.3",
-    "socket.io-client": "^4.8.3"
+    "pg": "^8.20.0",
+    "socket.io-client": "^4.8.3",
+    "typescript": "^5.9.3"
   }
 }

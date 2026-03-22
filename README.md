@@ -27,7 +27,7 @@ This plugin bridges OpenClaw and Cortex via Socket.IO:
 
 ## Prerequisites
 
-- A running Cortex instance ([cortex-api](https://github.com/cameronjweeks/cortex-api), [cortex-realtime](https://github.com/cameronjweeks/cortex-socket), [cortex-app](https://github.com/cameronjweeks/cortex-app))
+- A running Cortex instance ([cortex-api](https://github.com/cameronjweeks/cortex-api), [cortex-realtime](https://github.com/cameronjweeks/cortex-realtime), [cortex-app](https://github.com/cameronjweeks/cortex-app))
 - A bot user created in Cortex (with `is_ai = true` in the users table)
 - The bot registered on the [Bots page](https://github.com/cameronjweeks/cortex-app) in Cortex
 - OpenClaw installed and running
@@ -159,6 +159,26 @@ Your bot needs to be registered in Cortex for the [Bots management page](/bots) 
 - Check OpenClaw agent logs for errors
 - Verify the session key is valid
 - Ensure the channel has `auto_invite_ai` enabled or the bot was manually added
+
+## Code Structure
+
+```
+cortex-openclaw-channel/
+  index.ts                    — Plugin entry point, registers channel with OpenClaw
+  openclaw.plugin.json        — OpenClaw plugin metadata (id: cortex-channel)
+  config-example.json         — Configuration template
+  src/
+    channel.ts                — Core channel implementation (start, stop, send, WebSocket management)
+    runtime.ts                — OpenClaw runtime context holder
+    session-manager-v3.ts     — Bidirectional session manager (reset detection, token/message limits)
+    session-manager-v2.ts     — Previous session manager version
+    enhanced-channel.ts       — Extended plugin with rich status callbacks
+    status-manager.ts         — Maps OpenClaw tool invocations to typing/status indicators
+  lib/                        — Compiled JavaScript output (from TypeScript)
+  migrate-sessions.js         — JSONL session migration script
+  migrate-cortex-sessions.js  — Cortex session migration via OpenClaw CLI
+  force-sync-cli.js           — CLI utility for manual session synchronization
+```
 
 ## Development
 

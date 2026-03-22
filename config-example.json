@@ -1,0 +1,27 @@
+{
+  "accounts": [
+    {
+      "id": "main",
+      "type": "cortex-channel",
+      "config": {
+        "apiUrl": "http://localhost:3201",
+        "jwtToken": "your-jwt-token-here",
+        "userId": "1",
+        "allowAllChannels": true,
+        
+        "// Configurable thresholds (optional)": "",
+        "tokenWarningThreshold": 150000,
+        "tokenResetThreshold": 180000,
+        "messageResetThreshold": 500,
+        "sessionTimeoutMs": 86400000,
+        
+        "// Or use more aggressive settings for testing": "",
+        "_testConfig": {
+          "tokenWarningThreshold": 5000,
+          "tokenResetThreshold": 10000,
+          "messageResetThreshold": 50
+        }
+      }
+    }
+  ]
+}
