@@ -36,27 +36,34 @@ const SESSION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 function getStableSessionKey(channelId: number, cortexSessionKey: string): string {
   const now = Date.now();
   const existing = channelSessions.get(channelId);
-  
-  // Check if we have an existing session and it's not expired
-  if (existing && (now - existing.lastActivity) < SESSION_TIMEOUT_MS) {
-    // Update activity timestamp
+
+  // If cortex has rotated its session (e.g. user pressed "reset"), start a fresh
+  // OpenClaw session so context is actually compacted — otherwise the bot would
+  // keep the old conversation in context no matter how many times cortex reset.
+  const cortexRotated = existing && existing.cortexSessionKey !== cortexSessionKey;
+  const expired = existing && (now - existing.lastActivity) >= SESSION_TIMEOUT_MS;
+
+  if (existing && !cortexRotated && !expired) {
     existing.lastActivity = now;
-    existing.cortexSessionKey = cortexSessionKey; // Track current Cortex session
     channelSessions.set(channelId, existing);
-    
     console.log(`[cortex-channel] Using stable session ${existing.openclawSessionKey} for channel ${channelId} (Cortex: ${cortexSessionKey})`);
     return existing.openclawSessionKey;
   }
-  
-  // Create new stable session
-  const openclawSessionKey = `cortex-channel-${channelId}`;
+
+  // Key off the cortex session key so OpenClaw sees a distinct session per
+  // cortex reset. Fallback to legacy channel-scoped key if cortex didn't
+  // provide one (shouldn't happen in normal operation).
+  const openclawSessionKey = cortexSessionKey
+    ? `openclaw-${cortexSessionKey}`
+    : `cortex-channel-${channelId}`;
   channelSessions.set(channelId, {
     cortexSessionKey,
     openclawSessionKey,
-    lastActivity: now
+    lastActivity: now,
   });
-  
-  console.log(`[cortex-channel] Created stable session ${openclawSessionKey} for channel ${channelId} (Cortex: ${cortexSessionKey})`);
+
+  const reason = cortexRotated ? 'cortex rotated' : (expired ? 'expired' : 'new');
+  console.log(`[cortex-channel] Created OpenClaw session ${openclawSessionKey} for channel ${channelId} (${reason}, Cortex: ${cortexSessionKey})`);
   return openclawSessionKey;
 }
 
@@ -403,8 +410,9 @@ export const cortexPlugin = {
           const rt = getCortexRuntime();
           const currentCfg = rt.config.loadConfig();
 
-          // Fetch the active session key from cortex-api
+          // Fetch the active session (key + any summary seeded by a prior reset)
           let cortexSessionKey = `cortex-channel-${channelId}`;
+          let cortexSessionSummary: string | null = null;
           try {
             const sessionRes = await fetch(`${account.apiUrl}/v1/chat/channels/${channelId}/session`, {
               headers: { Authorization: `Bearer ${(socket.auth as any)?.token || ""}` },
@@ -414,19 +422,32 @@ export const cortexPlugin = {
               if (sessionData?.session?.sessionKey) {
                 cortexSessionKey = sessionData.session.sessionKey;
               }
+              if (sessionData?.session?.summary) {
+                cortexSessionSummary = sessionData.session.summary;
+              }
             }
           } catch (e: any) {
-            log?.warn?.(`Failed to fetch session key for channel ${channelId}: ${e.message}`);
+            log?.warn?.(`Failed to fetch session for channel ${channelId}: ${e.message}`);
           }
 
-          // Use stable session key for OpenClaw to maintain conversation continuity
+          // Detect whether this message begins a fresh OpenClaw session. If so,
+          // and cortex seeded a compaction summary on the session, inject it as
+          // context so the bot picks up where the prior session left off.
+          const previousOpenclawKey = channelSessions.get(channelId)?.openclawSessionKey;
           const sessionKey = getStableSessionKey(channelId, cortexSessionKey);
+          const openclawSessionRotated = previousOpenclawKey !== sessionKey;
 
           // Fetch channel tasks for context injection
           const jwtForTasks = (socket.auth as any)?.token || cachedJwtToken || token;
           const channelTasksList = await fetchChannelTasks(account.apiUrl, channelId, jwtForTasks);
           const tasksContext = formatTasksForContext(channelTasksList);
           const untrustedContext: string[] = [];
+          if (openclawSessionRotated && cortexSessionSummary) {
+            untrustedContext.push(
+              `Summary of previous conversation in this channel (prior session was compacted):\n\n${cortexSessionSummary}`
+            );
+            log?.info?.(`[cortex-channel] Injected compaction summary (${cortexSessionSummary.length} chars) into fresh OpenClaw session ${sessionKey}`);
+          }
           if (tasksContext) untrustedContext.push(tasksContext);
 
           // Download attachments and add to message context
