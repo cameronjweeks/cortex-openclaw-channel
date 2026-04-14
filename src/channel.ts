@@ -172,6 +172,16 @@ function getChannelConfig(cfg: any): any {
   return cfg?.channels?.cortex ?? {};
 }
 
+/**
+ * Resolve an account config by merging, in priority order:
+ *   1. openclaw config (channels.cortex.accounts[id] or channels.cortex)
+ *   2. environment variables (CORTEX_API_URL, CORTEX_REALTIME_URL,
+ *      CORTEX_JWT_SECRET, CORTEX_BOT_EMAIL, CORTEX_BOT_NAME)
+ *
+ * There are no hardcoded defaults: if neither source provides a required
+ * value, `isConfigured` will return false and the plugin will skip startup
+ * for that account rather than silently authenticate as someone else.
+ */
 function getAccountConfig(cfg: any, accountId?: string | null): any {
   const channelCfg = getChannelConfig(cfg);
   const id = accountId || DEFAULT_ACCOUNT_ID;
@@ -179,11 +189,11 @@ function getAccountConfig(cfg: any, accountId?: string | null): any {
   return {
     accountId: id,
     enabled: account.enabled !== false && channelCfg.enabled !== false,
-    apiUrl: account.apiUrl || channelCfg.apiUrl || "http://localhost:3201",
-    realtimeUrl: account.realtimeUrl || channelCfg.realtimeUrl || "http://localhost:3202",
-    jwtSecret: account.jwtSecret || channelCfg.jwtSecret || "",
-    botEmail: account.botEmail || channelCfg.botEmail || "bob@backv.co",
-    botName: account.botName || channelCfg.botName || "Bob",
+    apiUrl: account.apiUrl || channelCfg.apiUrl || process.env.CORTEX_API_URL || "",
+    realtimeUrl: account.realtimeUrl || channelCfg.realtimeUrl || process.env.CORTEX_REALTIME_URL || "",
+    jwtSecret: account.jwtSecret || channelCfg.jwtSecret || process.env.CORTEX_JWT_SECRET || "",
+    botEmail: account.botEmail || channelCfg.botEmail || process.env.CORTEX_BOT_EMAIL || "",
+    botName: account.botName || channelCfg.botName || process.env.CORTEX_BOT_NAME || "",
   };
 }
 
@@ -191,6 +201,9 @@ function listAccountIds(cfg: any): string[] {
   const channelCfg = getChannelConfig(cfg);
   if (channelCfg.accounts) return Object.keys(channelCfg.accounts);
   if (channelCfg.apiUrl || channelCfg.jwtSecret) return [DEFAULT_ACCOUNT_ID];
+  // Env-var-only configuration is supported too (useful in containerized /
+  // 12-factor deployments where ~/.openclaw/openclaw.json is minimal).
+  if (process.env.CORTEX_JWT_SECRET || process.env.CORTEX_API_URL) return [DEFAULT_ACCOUNT_ID];
   return [];
 }
 
@@ -206,7 +219,7 @@ function waitUntilAbort(signal?: AbortSignal, onAbort?: () => void): Promise<voi
 }
 
 function extractChannelId(target: string): number {
-  // target format: "cortex:channel:3" or "cortex:bob@backv.co" or just "3"
+  // target format: "cortex:channel:3" or "cortex:user@example.com" or just "3"
   const match = target.match(/(\d+)/);
   return match ? parseInt(match[1], 10) : 0;
 }
@@ -222,7 +235,11 @@ function sendViaSocket(channelId: number, text: string, account?: any): Promise<
       return;
     }
 
-    const apiUrl = account?.apiUrl || "https://cortex.bob.backv.co/api";
+    const apiUrl = account?.apiUrl;
+    if (!apiUrl) {
+      resolve({ ok: false, error: "cortex-channel: apiUrl not configured (set channels.cortex.apiUrl or CORTEX_API_URL)" });
+      return;
+    }
     let resolved = false;
 
     activeSocket.emit("apiRequest.request", {
@@ -285,7 +302,9 @@ export const cortexPlugin = {
     listAccountIds: (cfg: any) => listAccountIds(cfg),
     resolveAccount: (cfg: any, accountId?: string | null) => getAccountConfig(cfg, accountId),
     defaultAccountId: (_cfg: any) => DEFAULT_ACCOUNT_ID,
-    isConfigured: (account: any) => Boolean(account.jwtSecret && account.realtimeUrl),
+    isConfigured: (account: any) => Boolean(
+      account.jwtSecret && account.realtimeUrl && account.apiUrl && account.botEmail && account.botName
+    ),
   },
 
   outbound: {
@@ -322,8 +341,17 @@ export const cortexPlugin = {
         return waitUntilAbort(abortSignal);
       }
 
-      if (!account.jwtSecret) {
-        log?.warn?.(`Cortex account ${accountId} missing jwtSecret, skipping`);
+      // All of these are required. There are no hardcoded defaults — missing
+      // values must be supplied via channels.cortex in openclaw.json or via
+      // the CORTEX_* environment variables (see README).
+      const missing: string[] = [];
+      if (!account.jwtSecret) missing.push("jwtSecret / CORTEX_JWT_SECRET");
+      if (!account.apiUrl) missing.push("apiUrl / CORTEX_API_URL");
+      if (!account.realtimeUrl) missing.push("realtimeUrl / CORTEX_REALTIME_URL");
+      if (!account.botEmail) missing.push("botEmail / CORTEX_BOT_EMAIL");
+      if (!account.botName) missing.push("botName / CORTEX_BOT_NAME");
+      if (missing.length > 0) {
+        log?.warn?.(`Cortex account ${accountId} missing required config: ${missing.join(", ")} — skipping`);
         return waitUntilAbort(abortSignal);
       }
 
@@ -567,68 +595,73 @@ export const cortexPlugin = {
             class StatusManager {
               private socket: any;
               private channelId: number;
+              private botUser: { name: string; email: string };
               private currentTimer: any = null;
               private lastStatus: string | null = null;
-              
-              constructor(socket: any, channelId: number) {
+
+              constructor(socket: any, channelId: number, botUser: { name: string; email: string }) {
                 this.socket = socket;
                 this.channelId = channelId;
+                this.botUser = botUser;
               }
-              
+
               clearTimer() {
                 if (this.currentTimer) {
                   clearTimeout(this.currentTimer);
                   this.currentTimer = null;
                 }
               }
-              
+
               startTyping() {
                 this.clearTimer();
                 this.socket.emit("typing:start", { channelId: this.channelId });
                 this.lastStatus = "typing";
                 this.currentTimer = setTimeout(() => this.stopAll(), 30000);
               }
-              
+
               updateStatus(status: string, detail?: string) {
                 this.clearTimer();
-                
+
                 const statusMap: Record<string, string> = {
                   "web_search": "searching",
-                  "web_fetch": "browsing", 
+                  "web_fetch": "browsing",
                   "browser": "browsing",
                   "read": "reading",
                   "write": "writing",
                   "edit": "writing",
                   "thinking": "thinking"
                 };
-                
+
                 const mappedStatus = statusMap[status] || "working";
                 this.lastStatus = mappedStatus;
-                
+
                 this.socket.emit("ai:status", {
                   channelId: this.channelId,
                   status: mappedStatus,
                   detail: detail || null,
-                  user: { name: "Bob", email: "bob@backv.co" }
+                  user: this.botUser,
                 });
-                
+
                 this.currentTimer = setTimeout(() => this.stopAll(), 30000);
               }
-              
+
               stopAll() {
                 this.clearTimer();
                 if (this.lastStatus && this.lastStatus !== "typing") {
-                  this.socket.emit("ai:status", { 
-                    channelId: this.channelId, 
-                    status: null 
+                  this.socket.emit("ai:status", {
+                    channelId: this.channelId,
+                    status: null
                   });
                 }
                 this.socket.emit("typing:stop", { channelId: this.channelId });
                 this.lastStatus = null;
               }
             }
-            
-            const statusManager = new StatusManager(socket, channelId);
+
+            const statusManager = new StatusManager(socket, channelId, {
+              name: account.botName,
+              email: account.botEmail,
+            });
             
             // Set up heartbeat timer for task health monitoring
             let heartbeatTimer: NodeJS.Timer | null = null;
