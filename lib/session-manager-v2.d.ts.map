@@ -1,1 +1,0 @@
-{"version":3,"file":"session-manager-v2.d.ts","sourceRoot":"","sources":["../src/session-manager-v2.ts"],"names":[],"mappings":"AAYA,cAAM,oBAAoB;IACxB,OAAO,CAAC,QAAQ,CAAkC;IAClD,OAAO,CAAC,kBAAkB,CAAuB;IAEjD,aAAa,CAAC,SAAS,EAAE,MAAM,EAAE,gBAAgB,EAAE,MAAM,GAAG,MAAM;IA0ClE,OAAO,CAAC,iBAAiB;IAMzB,gBAAgB,CAAC,SAAS,EAAE,MAAM,EAAE,MAAM,EAAE,MAAM;CAMnD;AAED,eAAO,MAAM,cAAc,sBAA6B,CAAC"}

@@ -1,2 +1,19 @@
 node_modules/
-package-lock.json
+lib/
+*.log
+
+# compiled output (openclaw loads .ts directly; don't commit build artifacts)
+src/**/*.js
+src/**/*.js.map
+src/**/*.d.ts
+src/**/*.d.ts.map
+
+# editor / OS
+.DS_Store
+*.swp
+
+# backups / patches / one-off scripts
+*.backup
+*.backup.*
+*.patch
+test-*.js
