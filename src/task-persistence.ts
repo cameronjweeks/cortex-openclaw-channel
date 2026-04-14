@@ -30,7 +30,7 @@ interface PersistedTask {
 
 export class TaskPersistenceManager {
   private tasks = new Map<string, PersistedTask>();
-  private heartbeatTimer: NodeJS.Timer | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private apiUrl: string;
   private token: string;
   private log: any;
@@ -271,7 +271,7 @@ export class TaskPersistenceManager {
         return;
       }
       
-      const data = await res.json();
+      const data = (await res.json()) as { tasks?: any[] };
       const runningTasks = data.tasks || [];
       
       // Mark orphaned tasks as failed

@@ -99,7 +99,7 @@ async function fetchBotId(apiUrl: string, token: string): Promise<number | null>
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return null;
-    const data = await res.json();
+    const data = (await res.json()) as { bots?: Array<{ id: number }> };
     // Find the bot whose user matches this connection (first one owned or self)
     if (data.bots?.length) return data.bots[0].id;
     return null;
@@ -116,7 +116,7 @@ async function fetchChannelTasks(apiUrl: string, channelId: number, token: strin
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) return [];
-    const data = await res.json();
+    const data = (await res.json()) as { tasks?: any[] };
     return data.tasks || [];
   } catch {
     return [];
@@ -143,7 +143,7 @@ async function createChannelTask(
       body: JSON.stringify(data),
     });
     if (!res.ok) return null;
-    return (await res.json()).task;
+    return ((await res.json()) as { task?: any }).task;
   } catch {
     return null;
   }
@@ -160,7 +160,7 @@ async function updateChannelTaskStatus(
       body: JSON.stringify(updates),
     });
     if (!res.ok) return null;
-    return (await res.json()).task;
+    return ((await res.json()) as { task?: any }).task;
   } catch {
     return null;
   }
@@ -446,7 +446,7 @@ export const cortexPlugin = {
               headers: { Authorization: `Bearer ${(socket.auth as any)?.token || ""}` },
             });
             if (sessionRes.ok) {
-              const sessionData = await sessionRes.json();
+              const sessionData = (await sessionRes.json()) as { session?: { sessionKey?: string; summary?: string } };
               if (sessionData?.session?.sessionKey) {
                 cortexSessionKey = sessionData.session.sessionKey;
               }
@@ -589,6 +589,9 @@ export const cortexPlugin = {
 
           let taskStatus = "completed";
           let taskError: string | undefined;
+          // Hoisted so the outer finally{} block can clear it regardless of
+          // which try-branch threw.
+          let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
           try {
             // StatusManager for rich AI indicators (inline to avoid TS import issues)
@@ -663,11 +666,13 @@ export const cortexPlugin = {
               email: account.botEmail,
             });
             
-            // Set up heartbeat timer for task health monitoring
-            let heartbeatTimer: NodeJS.Timer | null = null;
-            if (taskPersistenceManager && taskKey) {
+            // Set up heartbeat timer for task health monitoring.
+            // Capture manager to a local const so TS narrows it inside the
+            // interval callback (the outer var is mutable module state).
+            const persistenceForHeartbeat = taskPersistenceManager;
+            if (persistenceForHeartbeat && taskKey) {
               heartbeatTimer = setInterval(async () => {
-                await taskPersistenceManager.heartbeat(taskKey);
+                await persistenceForHeartbeat.heartbeat(taskKey);
               }, 20000); // Send heartbeat every 20 seconds
             }
             
