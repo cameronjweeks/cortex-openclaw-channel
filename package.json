@@ -1,19 +1,47 @@
 {
   "name": "cortex-channel",
-  "version": "1.0.0",
-  "description": "",
+  "version": "2.0.0",
+  "description": "OpenClaw channel plugin that bridges OpenClaw agents to Cortex chat — rich AI status events, automatic channel task lifecycle, attachment handling, and crash-safe task persistence.",
   "main": "index.ts",
   "openclaw": {
     "extensions": [
       "./index.ts"
     ]
   },
+  "files": [
+    "index.ts",
+    "openclaw.plugin.json",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prepack": "npm run typecheck",
+    "typecheck": "tsc --noEmit"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "openclaw-channel",
+    "cortex",
+    "chat",
+    "ai",
+    "bot"
+  ],
+  "author": "Cameron Weeks",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cameronjweeks/cortex-openclaw-channel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cameronjweeks/cortex-openclaw-channel/issues"
+  },
+  "homepage": "https://github.com/cameronjweeks/cortex-openclaw-channel#readme",
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "@types/node-fetch": "^2.6.13",
     "jsonwebtoken": "^9.0.3",
