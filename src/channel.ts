@@ -685,7 +685,13 @@ export const cortexPlugin = {
                   const text = payload?.text ?? payload?.body;
                   if (!text?.trim()) return;
                   log?.info?.(`Delivering reply to channel ${channelId} (${text.substring(0, 60)}...)`);
-                  const result = await sendViaSocket(channelId, text);
+                  // Pass the resolved `account` through so sendViaSocket has
+                  // apiUrl. Before v2.0.0 this was covered by a hardcoded
+                  // fallback URL inside sendViaSocket; that was removed and
+                  // the omission turned every agent reply into a delivery
+                  // failure (#11 regression — gateway log: "apiUrl not
+                  // configured").
+                  const result = await sendViaSocket(channelId, text, account);
                   if (!result.ok) {
                     log?.error?.(`Failed to deliver reply: ${result.error}`);
                   }
