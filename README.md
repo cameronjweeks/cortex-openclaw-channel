@@ -44,10 +44,8 @@ The plugin runs inside the OpenClaw gateway and bridges it to Cortex:
 ### From npm (recommended)
 
 ```bash
-openclaw plugin install @<scope>/cortex-channel
+openclaw plugin install @cameronjweeks/cortex-channel
 ```
-
-(Replace `<scope>` with your published npm scope.)
 
 ### From git
 
