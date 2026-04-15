@@ -1,6 +1,6 @@
 {
   "name": "@cameronjweeks/cortex-channel",
-  "version": "2.2.2",
+  "version": "2.2.3",
   "description": "OpenClaw channel plugin that bridges OpenClaw agents to Cortex chat — rich AI status events, automatic channel task lifecycle, attachment handling, and crash-safe task persistence.",
   "main": "index.ts",
   "openclaw": {
