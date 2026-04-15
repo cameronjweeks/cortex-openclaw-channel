@@ -581,13 +581,15 @@ export const cortexPlugin = {
             const fs = await import("fs/promises");
             const path = await import("path");
             const os = await import("os");
-            const sessionsPath = path.join(os.homedir(), ".openclaw", "agents", "main", "sessions", "sessions.json");
+            const home = os.homedir();
+            const sessionsPath = path.join(home, ".openclaw", "agents", "main", "sessions", "sessions.json");
+            const configPath = path.join(home, ".openclaw", "openclaw.json");
             let totalTokens = 0;
+            let servedModel: string | null = null;
+            let expectedModel: string | null = null;
             try {
               const raw = await fs.readFile(sessionsPath, "utf8");
               const all = JSON.parse(raw) as Record<string, any>;
-              // Keys are namespaced, e.g. `agent:main:openclaw-cortex-channel-38-s1`.
-              // Match any entry whose key ends with our sessionKey.
               const suffix = `:${sessionKey}`;
               let best: any = null;
               for (const [k, v] of Object.entries(all)) {
@@ -596,10 +598,21 @@ export const cortexPlugin = {
                 }
               }
               if (best?.totalTokens) totalTokens = best.totalTokens;
+              if (best?.model) {
+                // Session stores bare model id (e.g. "nemotron-3-super:cloud").
+                // Provider is separate.
+                servedModel = best.modelProvider ? `${best.modelProvider}/${best.model}` : best.model;
+              }
+            } catch { /* non-critical */ }
+
+            // Read the configured primary so we can detect failovers.
+            try {
+              const cfgRaw = await fs.readFile(configPath, "utf8");
+              const cfg = JSON.parse(cfgRaw) as any;
+              expectedModel = cfg?.agents?.defaults?.model?.primary || null;
             } catch { /* non-critical */ }
 
             if (totalTokens > 0) {
-              // Update Cortex session with real token count
               const jwtToken = await generateJwt(account);
               await fetch(`${account.apiUrl}/v1/chat/channels/${channelId}/session`, {
                 method: "PUT",
@@ -611,8 +624,44 @@ export const cortexPlugin = {
               });
               log?.info?.(`Updated token count for channel ${channelId}: ${totalTokens}`);
             }
+
+            // Detect fallback: session served by a model other than the
+            // configured primary. Emit ai:status in-channel (via the
+            // active socket, same path as typing events) and, if a
+            // CORTEX_ALERTS_CHANNEL_ID is configured, post a one-line
+            // message to that channel via the apiRequest relay so the
+            // broadcast/unread-bump pipeline fires correctly.
+            if (servedModel && expectedModel && servedModel !== expectedModel) {
+              const msg = `${expectedModel.split("/").pop()} rate-limited → served by ${servedModel.split("/").pop()}`;
+              try {
+                if (activeSocket?.connected) {
+                  activeSocket.emit("ai:status", {
+                    channelId,
+                    status: "fallback",
+                    message: `⚠️ ${msg}`,
+                  });
+                }
+              } catch { /* best-effort */ }
+
+              const alertsId = parseInt(process.env.CORTEX_ALERTS_CHANNEL_ID || "0", 10);
+              if (alertsId > 0 && activeSocket?.connected) {
+                activeSocket.emit("apiRequest.request", {
+                  url: "/v1/chat/messages",
+                  params: {
+                    method: "POST",
+                    body: {
+                      channelId: alertsId,
+                      content: `⚠️ **Model fallback** in channel #${channelId}: ${msg}`,
+                      contentType: "text",
+                      metadata: { source: "cortex-channel", servedModel, expectedModel, originChannel: channelId },
+                    },
+                  },
+                }, () => { /* fire-and-forget */ });
+              }
+              log?.info?.(`Fallback detected: expected=${expectedModel} served=${servedModel}`);
+            }
           } catch (tokenErr: any) {
-            log?.warn?.(`Failed to update token count: ${tokenErr.message}`);
+            log?.warn?.(`Failed to update token count / detect fallback: ${tokenErr.message}`);
           }
         } catch (err: any) {
           log?.error?.(`Error processing Cortex message: ${err.message}`);
