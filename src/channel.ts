@@ -590,7 +590,7 @@ export const cortexPlugin = {
               const { execSync } = await import("child_process");
               try {
                 const output = execSync(
-                  `openclaw sessions --json 2>/dev/null | grep -A15 '"key": "${sessionKey}"'`,
+                  `openclaw sessions --json 2>/dev/null | grep -A15 '${sessionKey}"'`,
                   { encoding: "utf8", timeout: 5000 }
                 );
                 const tokenMatch = output.match(/"totalTokens":\s*(\d+)/);
