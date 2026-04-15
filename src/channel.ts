@@ -594,78 +594,71 @@ export const cortexPlugin = {
           let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
           try {
-            // StatusManager for rich AI indicators (inline to avoid TS import issues)
-            class StatusManager {
-              private socket: any;
-              private channelId: number;
-              private botUser: { name: string; email: string };
-              private currentTimer: any = null;
-              private lastStatus: string | null = null;
+            // Typing + ai:status pipeline.
+            //
+            // Previously this used a hand-rolled StatusManager that passed
+            // `onThinking`/`onToolCallStart`/`onToolCallEnd` options to the
+            // dispatcher. OpenClaw's dispatcher silently ignores those hook
+            // names — only `onReplyStart` / `onCleanup` / `typingCallbacks`
+            // are honored — so nothing fired mid-turn and typing timed out
+            // after 30s. The bundled Slack plugin gets around this by
+            // wrapping its typing emit in `createTypingCallbacks`, which
+            // handles keepalive internally: openclaw's agent runner calls
+            // `typing.start` on run start, on reasoning deltas, on tool
+            // starts, and on a keepalive timer; `createTypingCallbacks`
+            // debounces + refreshes so the indicator stays lit for the
+            // whole turn. Same pattern here.
+            //
+            // For the richer "status line" UI we also emit an ai:status
+            // event (status="working", detail="thinking...") on the same
+            // start/stop signals. That's the cortex-app equivalent of
+            // Slack's `assistant.threads.setStatus` text line. OpenClaw
+            // doesn't distinguish tool/reasoning/message starts at the
+            // channel layer, so we can't show per-tool labels like
+            // "searching" / "reading" — Slack has the same limitation.
+            // Dynamic import with type cast: openclaw isn't a declared
+            // peerDep on this package (we don't need its API for anything
+            // else and TS resolving it requires shimming @types), so we
+            // hit the subpath export at runtime only. The function shape
+            // is well-known per openclaw's plugin-sdk/channels/typing.d.ts.
+            const sdk = (await import(
+              "openclaw/plugin-sdk/channel-reply-pipeline" as string
+            )) as { createTypingCallbacks: (p: any) => any };
+            const { createTypingCallbacks } = sdk;
 
-              constructor(socket: any, channelId: number, botUser: { name: string; email: string }) {
-                this.socket = socket;
-                this.channelId = channelId;
-                this.botUser = botUser;
-              }
+            const botUser = { name: account.botName, email: account.botEmail };
 
-              clearTimer() {
-                if (this.currentTimer) {
-                  clearTimeout(this.currentTimer);
-                  this.currentTimer = null;
-                }
-              }
-
-              startTyping() {
-                this.clearTimer();
-                this.socket.emit("typing:start", { channelId: this.channelId });
-                this.lastStatus = "typing";
-                this.currentTimer = setTimeout(() => this.stopAll(), 30000);
-              }
-
-              updateStatus(status: string, detail?: string) {
-                this.clearTimer();
-
-                const statusMap: Record<string, string> = {
-                  "web_search": "searching",
-                  "web_fetch": "browsing",
-                  "browser": "browsing",
-                  "read": "reading",
-                  "write": "writing",
-                  "edit": "writing",
-                  "thinking": "thinking"
-                };
-
-                const mappedStatus = statusMap[status] || "working";
-                this.lastStatus = mappedStatus;
-
-                this.socket.emit("ai:status", {
-                  channelId: this.channelId,
-                  status: mappedStatus,
-                  detail: detail || null,
-                  user: this.botUser,
+            const typingCallbacks = createTypingCallbacks({
+              start: async () => {
+                socket.emit("typing:start", { channelId });
+                socket.emit("ai:status", {
+                  channelId,
+                  status: "working",
+                  detail: "thinking…",
+                  user: botUser,
                 });
-
-                this.currentTimer = setTimeout(() => this.stopAll(), 30000);
-              }
-
-              stopAll() {
-                this.clearTimer();
-                if (this.lastStatus && this.lastStatus !== "typing") {
-                  this.socket.emit("ai:status", {
-                    channelId: this.channelId,
-                    status: null
-                  });
-                }
-                this.socket.emit("typing:stop", { channelId: this.channelId });
-                this.lastStatus = null;
-              }
-            }
-
-            const statusManager = new StatusManager(socket, channelId, {
-              name: account.botName,
-              email: account.botEmail,
+              },
+              stop: async () => {
+                socket.emit("typing:stop", { channelId });
+                socket.emit("ai:status", { channelId, status: null });
+              },
+              onStartError: (err: unknown) => {
+                log?.debug?.(`typing start error (non-fatal): ${String(err)}`);
+              },
+              onStopError: (err: unknown) => {
+                log?.debug?.(`typing stop error (non-fatal): ${String(err)}`);
+              },
+              // OpenClaw's internal typing loop will call start() at this
+              // cadence while the run is active. 10s is tight enough that
+              // the 30s auto-clear in cortex-app's chat store never kicks
+              // in mid-turn, but not so aggressive that it floods the
+              // socket on long tool chains.
+              keepaliveIntervalMs: 10_000,
+              // Safety TTL: force-stop typing after 10 min no matter what,
+              // so a crashed agent run can't leave a permanent indicator.
+              maxDurationMs: 10 * 60_000,
             });
-            
+
             // Set up heartbeat timer for task health monitoring.
             // Capture manager to a local const so TS narrows it inside the
             // interval callback (the outer var is mutable module state).
@@ -675,7 +668,7 @@ export const cortexPlugin = {
                 await persistenceForHeartbeat.heartbeat(taskKey);
               }, 20000); // Send heartbeat every 20 seconds
             }
-            
+
             // Dispatch to agent — reply comes back via outbound.sendText
             await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
               ctx: msgCtx,
@@ -687,33 +680,22 @@ export const cortexPlugin = {
                   log?.info?.(`Delivering reply to channel ${channelId} (${text.substring(0, 60)}...)`);
                   // Pass the resolved `account` through so sendViaSocket has
                   // apiUrl. Before v2.0.0 this was covered by a hardcoded
-                  // fallback URL inside sendViaSocket; that was removed and
-                  // the omission turned every agent reply into a delivery
-                  // failure (#11 regression — gateway log: "apiUrl not
-                  // configured").
+                  // fallback URL inside sendViaSocket; removing that turned
+                  // every agent reply into a delivery failure until we fixed
+                  // the account-passing in v2.0.1.
                   const result = await sendViaSocket(channelId, text, account);
                   if (!result.ok) {
                     log?.error?.(`Failed to deliver reply: ${result.error}`);
                   }
                 },
-                onReplyStart: () => {
-                  statusManager.startTyping();
-                },
-                onReplyEnd: () => {
-                  statusManager.stopAll();
-                },
-                onThinking: ({ thinkingLevel }: any) => {
-                  statusManager.updateStatus("thinking", thinkingLevel);
-                },
-                onToolCallStart: ({ toolName }: any) => {
-                  log?.debug?.(`Tool call start: ${toolName}`);
-                  statusManager.updateStatus(toolName);
-                },
-                onToolCallEnd: () => {
-                  statusManager.updateStatus("thinking");
-                },
+                // Typing keepalive pipeline. OpenClaw's agent runner calls
+                // typingCallbacks.onReplyStart and keeps typing alive until
+                // the run settles / onCleanup fires.
+                typingCallbacks,
+                onReplyStart: typingCallbacks.onReplyStart,
+                onCleanup: typingCallbacks.onCleanup,
                 onError: () => {
-                  statusManager.stopAll();
+                  typingCallbacks.onCleanup?.();
                 },
               },
             });
