@@ -8,18 +8,22 @@
  */
 import { getCortexRuntime } from "./runtime.js";
 import { downloadAttachments } from "./download-attachments.js";
-import { TaskPersistenceManager } from "./task-persistence.js";
 
 const CHANNEL_ID = "cortex";
 const DEFAULT_ACCOUNT_ID = "default";
 
-// ─── Shared socket reference ─────────────────────────
-// The gateway.startAccount creates the socket connection.
-// outbound.sendText uses it to send replies via RPC.
+// ─── Shared socket + auth references ─────────────────
+// The gateway.startAccount creates the socket connection + JWT.
+// outbound.sendText uses the socket to send replies via RPC.
+// The task-management tools (src/tools.ts) read cachedApiUrl / cachedJwtToken
+// at execute time to authenticate their cortex-api calls.
 let activeSocket: any = null;
-let cachedBotId: number | null = null;
+let cachedApiUrl: string | null = null;
 let cachedJwtToken: string | null = null;
-let taskPersistenceManager: TaskPersistenceManager | null = null;
+
+// Accessors exposed to tools.ts (avoids a direct module-to-module closure).
+export function __getCortexApiUrl(): string | null { return cachedApiUrl; }
+export function __getCortexJwtToken(): string | null { return cachedJwtToken; }
 
 // ─── Session Management ──────────────────────────────
 // Maintain stable OpenClaw sessions per channel to prevent fragmentation
@@ -67,48 +71,14 @@ function getStableSessionKey(channelId: number, cortexSessionKey: string): strin
   return openclawSessionKey;
 }
 
-// ─── Task reporting helper ───────────────────────────
-
-async function reportTask(
-  apiUrl: string,
-  botId: number,
-  token: string,
-  data: { taskKey: string; label: string; status: string; type?: string; metadata?: any }
-): Promise<void> {
-  try {
-    const res = await fetch(`${apiUrl}/v1/bots/${botId}/tasks`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(data),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      console.error(`[cortex-channel] Task report failed (${res.status}): ${body}`);
-    }
-  } catch (err: any) {
-    console.error(`[cortex-channel] Task report error: ${err.message}`);
-  }
-}
-
-async function fetchBotId(apiUrl: string, token: string): Promise<number | null> {
-  try {
-    const res = await fetch(`${apiUrl}/v1/bots`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!res.ok) return null;
-    const data = (await res.json()) as { bots?: Array<{ id: number }> };
-    // Find the bot whose user matches this connection (first one owned or self)
-    if (data.bots?.length) return data.bots[0].id;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-// ─── Channel Task helpers ────────────────────────────
+// ─── Channel Task helpers (read-only for context injection) ───
+//
+// The bot manages the task list itself via the channel_tasks_*
+// openclaw tools registered in src/tools.ts. This helper just pulls
+// the current list so we can inject it into UntrustedContext on
+// every inbound turn — the agent sees "here's what's already on the
+// task list" and can decide to update an existing task rather than
+// create a duplicate.
 
 async function fetchChannelTasks(apiUrl: string, channelId: number, token: string): Promise<any[]> {
   try {
@@ -129,41 +99,7 @@ function formatTasksForContext(tasks: any[]): string | null {
     const icon = t.status === 'in_progress' ? '◉' : t.status === 'completed' ? '✓' : t.status === 'cancelled' ? '✕' : '○';
     return `- [${icon} ${t.status.replace('_', ' ')}] #${t.id}: ${t.label}`;
   });
-  return `Channel Tasks:\n${lines.join('\n')}`;
-}
-
-async function createChannelTask(
-  apiUrl: string, channelId: number, token: string,
-  data: { label: string; status?: string; sourceMessageId?: number; metadata?: any }
-): Promise<any | null> {
-  try {
-    const res = await fetch(`${apiUrl}/v1/chat/channels/${channelId}/tasks`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify(data),
-    });
-    if (!res.ok) return null;
-    return ((await res.json()) as { task?: any }).task;
-  } catch {
-    return null;
-  }
-}
-
-async function updateChannelTaskStatus(
-  apiUrl: string, channelId: number, taskId: number, token: string,
-  updates: { status?: string; label?: string; metadata?: any }
-): Promise<any | null> {
-  try {
-    const res = await fetch(`${apiUrl}/v1/chat/channels/${channelId}/tasks/${taskId}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify(updates),
-    });
-    if (!res.ok) return null;
-    return ((await res.json()) as { task?: any }).task;
-  } catch {
-    return null;
-  }
+  return `Channel Tasks (use channel_tasks_* tools to update):\n${lines.join('\n')}`;
 }
 
 // ─── Config helpers ──────────────────────────────────
@@ -377,26 +313,10 @@ export const cortexPlugin = {
         log?.info?.("✓ Connected to Cortex Realtime");
         ctx.setStatus?.({ running: true, lastStartAt: new Date().toISOString() });
 
-        // Cache bot ID and JWT for task reporting
-        if (!cachedBotId) {
-          cachedJwtToken = token;
-          cachedBotId = await fetchBotId(account.apiUrl, token);
-          if (cachedBotId) {
-            log?.info?.(`Bot ID resolved: ${cachedBotId}`);
-            
-            // Initialize task persistence manager
-            if (!taskPersistenceManager) {
-              taskPersistenceManager = new TaskPersistenceManager(account.apiUrl, token, log, socket);
-              await taskPersistenceManager.init();
-              
-              // Clean up any orphaned tasks from previous run
-              await taskPersistenceManager.cleanupOrphanedTasks(cachedBotId);
-              log?.info?.("Task persistence manager initialized");
-            }
-          } else {
-            log?.warn?.("Could not resolve bot ID — task reporting disabled");
-          }
-        }
+        // Cache apiUrl + JWT so the channel_tasks_* tools registered
+        // in src/tools.ts can reach cortex-api at agent-tool-call time.
+        cachedApiUrl = account.apiUrl;
+        cachedJwtToken = token;
       });
 
       socket.on("disconnect", (reason: string) => {
@@ -538,60 +458,11 @@ export const cortexPlugin = {
 
           log?.info?.(`Dispatching to agent for channel ${channelId}...`);
 
-          // Report bot_task as running (existing system-level tracking)
-          const taskKey = `msg-${channelId}-${Date.now()}`;
-          const taskLabel = content.length > 80 ? content.substring(0, 77) + "..." : content;
-          if (cachedBotId && cachedJwtToken) {
-            reportTask(account.apiUrl, cachedBotId, cachedJwtToken, {
-              taskKey,
-              label: taskLabel,
-              status: "running",
-              type: "session",
-              metadata: { sessionKey, channelId, sender: senderName },
-            });
-            
-            // Add task to persistence manager
-            if (taskPersistenceManager) {
-              await taskPersistenceManager.addTask({
-                taskKey,
-                botId: cachedBotId,
-                channelId,
-                sessionKey,
-                label: taskLabel,
-                status: "running",
-                metadata: { sender: senderName },
-              });
-            }
-          }
-
-          // Create a channel task for this work item (visible in the UI panel)
-          let channelTaskId: number | null = null;
-          const channelTaskToken = jwtForTasks;
-          try {
-            const ct = await createChannelTask(account.apiUrl, channelId, channelTaskToken, {
-              label: taskLabel,
-              status: "in_progress",
-              sourceMessageId: message.id || null,
-              metadata: { sender: senderName, sessionKey, automated: true },
-            });
-            if (ct) {
-              channelTaskId = ct.id;
-              log?.info?.(`Channel task #${ct.id} created for channel ${channelId}`);
-              
-              // Update persistence with channel task ID
-              if (taskPersistenceManager && taskKey) {
-                await taskPersistenceManager.updateTask(taskKey, { channelTaskId: ct.id });
-              }
-            }
-          } catch (ctErr: any) {
-            log?.warn?.(`Failed to create channel task: ${ctErr.message}`);
-          }
-
-          let taskStatus = "completed";
-          let taskError: string | undefined;
-          // Hoisted so the outer finally{} block can clear it regardless of
-          // which try-branch threw.
-          let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+          // NOTE: no auto-task is created here anymore. Task management on
+          // the Cortex channel is now bot-driven via the channel_tasks_*
+          // tools in src/tools.ts — the bot decides when work is
+          // complex enough to warrant a task list. See SOUL.md / BOOT.md
+          // for the heuristic.
 
           try {
             // Typing + ai:status pipeline.
@@ -659,16 +530,6 @@ export const cortexPlugin = {
               maxDurationMs: 10 * 60_000,
             });
 
-            // Set up heartbeat timer for task health monitoring.
-            // Capture manager to a local const so TS narrows it inside the
-            // interval callback (the outer var is mutable module state).
-            const persistenceForHeartbeat = taskPersistenceManager;
-            if (persistenceForHeartbeat && taskKey) {
-              heartbeatTimer = setInterval(async () => {
-                await persistenceForHeartbeat.heartbeat(taskKey);
-              }, 20000); // Send heartbeat every 20 seconds
-            }
-
             // Dispatch to agent — reply comes back via outbound.sendText
             await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
               ctx: msgCtx,
@@ -700,47 +561,11 @@ export const cortexPlugin = {
               },
             });
           } catch (dispatchErr: any) {
-            taskStatus = "failed";
-            taskError = dispatchErr.message;
+            // Let the error propagate — typing pipeline cleans itself up
+            // via onError/onCleanup; nothing else to do here. The bot's
+            // own channel_tasks tools are responsible for reflecting run
+            // failure in the task list (if it had created any).
             throw dispatchErr;
-          } finally {
-            // Stop heartbeat timer
-            if (heartbeatTimer) {
-              clearInterval(heartbeatTimer);
-            }
-            
-            // Complete task via persistence manager (which handles both bot and channel tasks)
-            if (taskPersistenceManager && taskKey) {
-              await taskPersistenceManager.completeTask(taskKey, taskStatus as 'completed' | 'failed', taskError);
-            } else if (cachedBotId && cachedJwtToken) {
-              // Fallback if no persistence manager
-              reportTask(account.apiUrl, cachedBotId, cachedJwtToken, {
-                taskKey,
-                label: taskLabel,
-                status: taskStatus,
-                type: "session",
-                metadata: {
-                  sessionKey,
-                  channelId,
-                  sender: senderName,
-                  ...(taskError ? { error: taskError } : {}),
-                },
-              });
-            }
-
-            // Complete the channel task (auto-hide after 24h kicks in server-side)
-            if (channelTaskId) {
-              try {
-                const finalStatus = taskStatus === "failed" ? "cancelled" : "completed";
-                await updateChannelTaskStatus(account.apiUrl, channelId, channelTaskId, channelTaskToken, {
-                  status: finalStatus,
-                  ...(taskError ? { metadata: { error: taskError } } : {}),
-                });
-                log?.info?.(`Channel task #${channelTaskId} → ${finalStatus}`);
-              } catch (ctErr: any) {
-                log?.warn?.(`Failed to update channel task #${channelTaskId}: ${ctErr.message}`);
-              }
-            }
           }
 
           log?.info?.(`Dispatch completed for channel ${channelId}`);
@@ -798,14 +623,9 @@ export const cortexPlugin = {
       // Clean up on abort
       return waitUntilAbort(abortSignal, async () => {
         log?.info?.("Stopping Cortex Chat channel");
-        
-        // Persist all active tasks before shutting down
-        if (taskPersistenceManager) {
-          await taskPersistenceManager.shutdown();
-          taskPersistenceManager = null;
-        }
-        
         activeSocket = null;
+        cachedApiUrl = null;
+        cachedJwtToken = null;
         socket.disconnect();
       });
     },
