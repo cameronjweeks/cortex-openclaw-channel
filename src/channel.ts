@@ -570,33 +570,33 @@ export const cortexPlugin = {
 
           log?.info?.(`Dispatch completed for channel ${channelId}`);
 
-          // Report real token usage from OpenClaw session back to Cortex
+          // Report real token usage from OpenClaw session back to Cortex.
+          // We read ~/.openclaw/agents/main/sessions/sessions.json directly
+          // because (a) the in-memory session store passed via `rt` is not
+          // reliably populated in the plugin dispatch context, and (b) the
+          // gateway systemd unit doesn't have `openclaw` on PATH, so shelling
+          // out to the CLI was failing silently. The JSON file is the
+          // source-of-truth the gateway itself writes after every turn.
           try {
-            const sessions = rt.config?.sessionStore?.sessions || rt.sessions;
-            // Try to read session token info from the store
+            const fs = await import("fs/promises");
+            const path = await import("path");
+            const os = await import("os");
+            const sessionsPath = path.join(os.homedir(), ".openclaw", "agents", "main", "sessions", "sessions.json");
             let totalTokens = 0;
-            if (sessions) {
-              // The session store might be accessible via runtime
-              const sessionEntry = typeof sessions.get === 'function' 
-                ? sessions.get(sessionKey) 
-                : sessions[sessionKey];
-              if (sessionEntry?.totalTokens) {
-                totalTokens = sessionEntry.totalTokens;
+            try {
+              const raw = await fs.readFile(sessionsPath, "utf8");
+              const all = JSON.parse(raw) as Record<string, any>;
+              // Keys are namespaced, e.g. `agent:main:openclaw-cortex-channel-38-s1`.
+              // Match any entry whose key ends with our sessionKey.
+              const suffix = `:${sessionKey}`;
+              let best: any = null;
+              for (const [k, v] of Object.entries(all)) {
+                if (k === sessionKey || k.endsWith(suffix)) {
+                  if (!best || (v?.updatedAt ?? 0) > (best?.updatedAt ?? 0)) best = v;
+                }
               }
-            }
-            
-            // If we can't read the session store directly, try the CLI approach
-            if (!totalTokens) {
-              const { execSync } = await import("child_process");
-              try {
-                const output = execSync(
-                  `openclaw sessions --json 2>/dev/null | grep -A15 '${sessionKey}"'`,
-                  { encoding: "utf8", timeout: 5000 }
-                );
-                const tokenMatch = output.match(/"totalTokens":\s*(\d+)/);
-                if (tokenMatch) totalTokens = parseInt(tokenMatch[1]);
-              } catch { /* non-critical */ }
-            }
+              if (best?.totalTokens) totalTokens = best.totalTokens;
+            } catch { /* non-critical */ }
 
             if (totalTokens > 0) {
               // Update Cortex session with real token count
