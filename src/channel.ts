@@ -356,22 +356,26 @@ export const cortexPlugin = {
 
         try {
           const rt = getCortexRuntime();
-          const currentCfg = rt.config.loadConfig();
+          let currentCfg = rt.config.loadConfig();
 
           // Fetch the active session (key + any summary seeded by a prior reset)
           let cortexSessionKey = `cortex-channel-${channelId}`;
           let cortexSessionSummary: string | null = null;
+          let sessionModelOverride: string | null = null;
           try {
             const sessionRes = await fetch(`${account.apiUrl}/v1/chat/channels/${channelId}/session`, {
               headers: { Authorization: `Bearer ${(socket.auth as any)?.token || ""}` },
             });
             if (sessionRes.ok) {
-              const sessionData = (await sessionRes.json()) as { session?: { sessionKey?: string; summary?: string } };
+              const sessionData = (await sessionRes.json()) as { session?: { sessionKey?: string; summary?: string; modelOverride?: string } };
               if (sessionData?.session?.sessionKey) {
                 cortexSessionKey = sessionData.session.sessionKey;
               }
               if (sessionData?.session?.summary) {
                 cortexSessionSummary = sessionData.session.summary;
+              }
+              if (sessionData?.session?.modelOverride) {
+                sessionModelOverride = sessionData.session.modelOverride;
               }
             }
           } catch (e: any) {
@@ -455,6 +459,26 @@ export const cortexPlugin = {
             UntrustedContext: untrustedContext,
             ...(mediaData.length > 0 && { MediaData: mediaData }),
           });
+
+          // Apply per-session model override if the user picked a
+          // different model from the chat UI. Deep-clone the model path
+          // so concurrent dispatches on other channels aren't affected.
+          if (sessionModelOverride) {
+            currentCfg = {
+              ...currentCfg,
+              agents: {
+                ...(currentCfg.agents || {}),
+                defaults: {
+                  ...((currentCfg.agents || {} as any).defaults || {}),
+                  model: {
+                    ...(((currentCfg.agents || {} as any).defaults || {} as any).model || {}),
+                    primary: sessionModelOverride,
+                  },
+                },
+              },
+            };
+            log?.info?.(`Model override for channel ${channelId}: ${sessionModelOverride}`);
+          }
 
           log?.info?.(`Dispatching to agent for channel ${channelId}...`);
 
@@ -612,17 +636,33 @@ export const cortexPlugin = {
               expectedModel = cfg?.agents?.defaults?.model?.primary || null;
             } catch { /* non-critical */ }
 
-            if (totalTokens > 0) {
+            if (totalTokens > 0 || servedModel) {
               const jwtToken = await generateJwt(account);
+              // Split "provider/model" back into separate fields for the DB.
+              let modelName: string | undefined;
+              let modelProv: string | undefined;
+              if (servedModel) {
+                const slash = servedModel.indexOf("/");
+                if (slash > 0) {
+                  modelProv = servedModel.slice(0, slash);
+                  modelName = servedModel.slice(slash + 1);
+                } else {
+                  modelName = servedModel;
+                }
+              }
               await fetch(`${account.apiUrl}/v1/chat/channels/${channelId}/session`, {
                 method: "PUT",
                 headers: {
                   "Content-Type": "application/json",
                   "Authorization": `Bearer ${jwtToken}`,
                 },
-                body: JSON.stringify({ tokenCount: totalTokens }),
+                body: JSON.stringify({
+                  ...(totalTokens > 0 ? { tokenCount: totalTokens } : {}),
+                  ...(modelName ? { model: modelName } : {}),
+                  ...(modelProv ? { modelProvider: modelProv } : {}),
+                }),
               });
-              log?.info?.(`Updated token count for channel ${channelId}: ${totalTokens}`);
+              log?.info?.(`Updated session for channel ${channelId}: tokens=${totalTokens} model=${servedModel}`);
             }
 
             // Detect fallback: session served by a model other than the
