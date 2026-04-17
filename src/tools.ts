@@ -72,6 +72,33 @@ function requireAuth(taskCtx: TaskToolsContext): { apiUrl: string; token: string
   return { apiUrl, token };
 }
 
+// ─── Followup schemas ──────────────────────────────────────────
+const scheduleReminderParamsSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["when", "message"],
+  properties: {
+    when: {
+      type: "string",
+      description:
+        "ISO-8601 datetime (UTC) for when the reminder should fire, e.g. '2026-04-17T15:00:00Z'. " +
+        "Must be in the future.",
+    },
+    message: {
+      type: "string",
+      description:
+        "The text to post in the channel when the time comes. Be specific — the user will see this " +
+        "as a bot-authored message at the scheduled time.",
+    },
+    goal: {
+      type: "string",
+      description:
+        "Optional short label (≤60 chars) shown in the followup chip UI. Defaults to the first 60 chars of message.",
+    },
+  },
+} as const;
+
+// ─── Task schemas ──────────────────────────────────────────────
 // zod isn't a plugin dependency, so parameters are hand-rolled schemas.
 // OpenClaw accepts JSON Schema here.
 const listParamsSchema = {
@@ -207,6 +234,59 @@ export function createChannelTaskTools(taskCtx: TaskToolsContext) {
         },
       },
       opts: { name: "channel_tasks_update" },
+    },
+
+    // ─── Followup tools (Phase 1: schedule_reminder only) ────
+    {
+      def: {
+        name: "schedule_reminder",
+        label: "Schedule a reminder",
+        description:
+          "Schedule a reminder message to be posted in this channel at a specific time. " +
+          "Use this EVERY TIME you promise to follow up or remind the user of something later. " +
+          "The system will post the message on your behalf at the scheduled time, even if your " +
+          "runtime is offline. The user will see a ⏰ chip in the channel UI showing pending reminders.\n\n" +
+          "Examples of when to use this:\n" +
+          "- User says 'remind me at 3pm about the standup' → call schedule_reminder\n" +
+          "- You say 'I'll check back in 30 minutes' → call schedule_reminder\n" +
+          "- User asks to be pinged about something tomorrow → call schedule_reminder\n\n" +
+          "Do NOT just say you'll follow up — actually schedule it with this tool.",
+        parameters: scheduleReminderParamsSchema,
+        execute: async (_toolCallId: string, rawParams: any, ctx: { sessionKey?: string }) => {
+          const channelId = requireChannel(ctx);
+          const { apiUrl, token } = requireAuth(taskCtx);
+          const when = String(rawParams?.when || "").trim();
+          if (!when) throw new Error("when is required (ISO-8601 UTC)");
+          const message = String(rawParams?.message || "").trim();
+          if (!message) throw new Error("message is required");
+          const goal = rawParams?.goal ? String(rawParams.goal).slice(0, 60) : message.slice(0, 60);
+
+          const body = await fetchJson(
+            `${apiUrl}/v1/chat/channels/${channelId}/followups`,
+            {
+              method: "POST",
+              body: JSON.stringify({
+                kind: "reminder",
+                deadline_at: when,
+                goal,
+                briefing: message,
+              }),
+            },
+            token,
+          );
+          const followup = body?.followup;
+          return {
+            content: [
+              {
+                type: "text",
+                text: `⏰ Reminder scheduled for ${followup?.deadline_at || when}: "${goal}"`,
+              },
+            ],
+            details: { channelId, followup },
+          };
+        },
+      },
+      opts: { name: "schedule_reminder" },
     },
   ];
 }
